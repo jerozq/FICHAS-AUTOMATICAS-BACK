@@ -11,7 +11,12 @@ import tempfile
 # Imports for document processing (adapted from the original main.py)
 from docxtpl import DocxTemplate
 from openpyxl import load_workbook
-from docx2pdf import convert as docx2pdf_convert
+try:
+    from docx2pdf import convert as docx2pdf_convert
+    DOCX2PDF_AVAILABLE = True
+except ImportError:
+    DOCX2PDF_AVAILABLE = False
+import subprocess
 from PyPDF2 import PdfMerger
 from datetime import datetime
 import time
@@ -349,11 +354,23 @@ def llenar_word(plantilla, salida, datos):
 def convertir_docx_a_pdf(docx_path):
     pdf_path = docx_path.replace(".docx", ".pdf")
     try:
-        docx2pdf_convert(docx_path)
-        if os.path.exists(pdf_path):
-            return pdf_path
+        if DOCX2PDF_AVAILABLE:
+            docx2pdf_convert(docx_path)
+            if os.path.exists(pdf_path):
+                return pdf_path
+        else:
+            # Fallback para Linux usando LibreOffice
+            out_dir = os.path.dirname(os.path.abspath(docx_path))
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pdf", os.path.abspath(docx_path), "--outdir", out_dir],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            if os.path.exists(pdf_path):
+                return pdf_path
     except Exception as e:
-        print("No se pudo convertir DOCX a PDF con docx2pdf:", e)
+        print("No se pudo convertir DOCX a PDF:", e)
     return None
 
 def convertir_xlsx_a_pdf_windows(xlsx_path, output_pdf_path):
