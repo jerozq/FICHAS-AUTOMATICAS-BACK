@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-python-multipart
-openpyxl
-docxtpl
-PyPDF2
-python-docx
-#docx2pdf  # Recomendado en Windows, pero incompatible de forma nativa en Linux
-#pypiwin32
