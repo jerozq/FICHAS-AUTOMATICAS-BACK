@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / compressed files
+__pycache__/        # Python 3 byte-compiled files
+*.pyc               # Python 2 byte-compiled files
+*.pyd
+*.pyo
+
+# Virtual environments
+.venv/              # Common virtual environment directory name
+env/                # Common virtual environment directory name
+venv/
+ENV/
+bin/
+include/
+lib/
+lib64/
+
+# IDE-specific files and directories
+.idea/              # JetBrains PyCharm project files
+.vscode/            # VS Code configuration files
+*.swp               # Vim swap files
+
+# Generated files
+*.log               # Log files
+*.temp
+*.tmp
+build/              # Build artifacts
+dist/               # Distribution archives
+*.egg-info/
+.pytest_cache/      # pytest cache directory
+
+# Environment variables
+.env                # File containing local environment variables/secrets
