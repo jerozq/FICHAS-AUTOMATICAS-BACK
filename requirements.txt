@@ -6,4 +6,4 @@ docxtpl
 docx2pdf
 PyPDF2
 python-docx
-pypiwin32
+#pypiwin32
