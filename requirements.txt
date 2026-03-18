@@ -1,3 +1,7 @@
--r requirements-base.txt
-pypiwin32
-docx2pdf
+fastapi
+uvicorn
+python-multipart
+openpyxl
+docxtpl
+PyPDF2
+python-docx
