@@ -7,6 +7,7 @@ import shutil
 import uuid
 from typing import Dict, Any, List
 import tempfile
+import zipfile
 
 # Imports for document processing (adapted from the original main.py)
 from docxtpl import DocxTemplate
@@ -43,7 +44,8 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUTA_FORMATOS = os.path.join(BASE_DIR, "formatos")
-RUTA_SALIDA = os.path.join(BASE_DIR, "salida")
+# En Vercel, solo podemos escribir en /tmp
+RUTA_SALIDA = os.path.join(tempfile.gettempdir(), "fichas_salida")
 os.makedirs(RUTA_FORMATOS, exist_ok=True)
 os.makedirs(RUTA_SALIDA, exist_ok=True)
 
@@ -440,37 +442,26 @@ async def generate_documents(datos: Dict[str, Any]):
         llenar_excel2(formato2_in, excel2_out, datos)
         llenar_word(formato3_in, word_out, datos)
 
-        pdfs_generados = []
-        pdf_word = convertir_docx_a_pdf(word_out)
-        if pdf_word:
-            pdfs_generados.append(pdf_word)
-
-        excel1_pdf = excel1_out.replace(".xlsx", ".pdf")
-        excel2_pdf = excel2_out.replace(".xlsx", ".pdf")
-
-        if WIN32_AVAILABLE:
-            ok1, err1 = convertir_xlsx_a_pdf_windows(excel1_out, excel1_pdf)
-            if ok1: pdfs_generados.append(excel1_pdf)
-            else: print(err1)
-            
-            ok2, err2 = convertir_xlsx_a_pdf_windows(excel2_out, excel2_pdf)
-            if ok2: pdfs_generados.append(excel2_pdf)
-            else: print(err2)
-
-        orden = [excel1_pdf, pdf_word, excel2_pdf]
-        orden_existentes = [p for p in orden if p and os.path.exists(p)]
+        # Archivos generados correctamente (en /tmp)
+        archivos_generados = [excel1_out, excel2_out, word_out]
+        
+        # Crear archivo ZIP para retornar de inmediato
         nombre_completo = f"{datos.get('primer_nombre','')} {datos.get('segundo_nombre','')} {datos.get('primer_apellido','')} {datos.get('segundo_apellido','')}".strip().replace(" ", "_").upper()
         if not nombre_completo: nombre_completo = "SIN_NOMBRE"
-        salida_final_name = f"FICHA_{nombre_completo}.pdf"
-        salida_final = os.path.join(RUTA_SALIDA, salida_final_name)
+        zip_filename = f"FICHAS_{nombre_completo}.zip"
+        zip_path = os.path.join(RUTA_SALIDA, zip_filename)
         
-        unir_pdfs(orden_existentes, salida_final)
+        # Comprimir
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for archivo in archivos_generados:
+                if os.path.exists(archivo):
+                    zipf.write(archivo, os.path.basename(archivo))
+                    
+        if not os.path.exists(zip_path):
+            raise HTTPException(status_code=500, detail="No se pudo crear el archivo ZIP consolidado")
 
-        if not os.path.exists(salida_final):
-            raise HTTPException(status_code=500, detail="No se pudo generar el PDF final consolidado")
-
-        # Devuelve el link para descargar
-        return {"download_url": f"/api/download/{salida_final_name}", "filename": salida_final_name}
+        # Devolver el archivo directamente
+        return FileResponse(zip_path, media_type='application/zip', filename=zip_filename)
 
     except Exception as e:
         import traceback
