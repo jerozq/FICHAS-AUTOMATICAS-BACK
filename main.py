@@ -3,11 +3,18 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import shutil
 import uuid
 from typing import Dict, Any, List
 import tempfile
 import zipfile
+import requests
+import base64
 
 # Imports for document processing (adapted from the original main.py)
 from docxtpl import DocxTemplate
@@ -420,6 +427,35 @@ def unir_pdfs(lista_pdfs, salida_final):
     merger.write(salida_final)
     merger.close()
 
+def convertir_documento_api(file_path: str):
+    api_secret = os.getenv("CONVERT_API_SECRET")
+    if not api_secret:
+        print("ADVERTENCIA: CONVERT_API_SECRET no está configurado.")
+        return None
+        
+    ext = file_path.split('.')[-1].lower()
+    if ext not in ['docx', 'xlsx']:
+        return None
+        
+    url = f"https://v2.convertapi.com/convert/{ext}/to/pdf?Secret={api_secret}"
+    try:
+        with open(file_path, "rb") as f:
+            files = {"File": f}
+            response = requests.post(url, files=files, timeout=60)
+            
+        if response.status_code == 200:
+            data = response.json()
+            if "Files" in data and len(data["Files"]) > 0:
+                file_data = base64.b64decode(data["Files"][0]["FileData"])
+                out_path = file_path.replace(f".{ext}", ".pdf")
+                with open(out_path, "wb") as out:
+                    out.write(file_data)
+                return out_path
+        print(f"Error de ConvertAPI: {response.text}")
+    except Exception as e:
+        print(f"Error llamando a ConvertAPI: {e}")
+    return None
+
 @app.post("/api/generate")
 async def generate_documents(datos: Dict[str, Any]):
     uid = str(uuid.uuid4())[:8]
@@ -443,25 +479,31 @@ async def generate_documents(datos: Dict[str, Any]):
         llenar_word(formato3_in, word_out, datos)
 
         # Archivos generados correctamente (en /tmp)
-        archivos_generados = [excel1_out, excel2_out, word_out]
+        # Convertirlos a PDF vía ConvertAPI
+        pdf_excel1 = convertir_documento_api(excel1_out)
+        pdf_word = convertir_documento_api(word_out)
+        pdf_excel2 = convertir_documento_api(excel2_out)
         
-        # Crear archivo ZIP para retornar de inmediato
+        # Unir PDFs en el orden solicitado: Formato 1, Formato 3, Formato 2
+        orden = [pdf_excel1, pdf_word, pdf_excel2]
+        orden_existentes = [p for p in orden if p and os.path.exists(p)]
+        
         nombre_completo = f"{datos.get('primer_nombre','')} {datos.get('segundo_nombre','')} {datos.get('primer_apellido','')} {datos.get('segundo_apellido','')}".strip().replace(" ", "_").upper()
         if not nombre_completo: nombre_completo = "SIN_NOMBRE"
-        zip_filename = f"FICHAS_{nombre_completo}.zip"
-        zip_path = os.path.join(RUTA_SALIDA, zip_filename)
         
-        # Comprimir
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for archivo in archivos_generados:
-                if os.path.exists(archivo):
-                    zipf.write(archivo, os.path.basename(archivo))
-                    
-        if not os.path.exists(zip_path):
-            raise HTTPException(status_code=500, detail="No se pudo crear el archivo ZIP consolidado")
+        salida_final_name = f"FICHA_{nombre_completo}.pdf"
+        salida_final = os.path.join(RUTA_SALIDA, salida_final_name)
+        
+        if len(orden_existentes) > 0:
+            unir_pdfs(orden_existentes, salida_final)
+        else:
+            raise HTTPException(status_code=500, detail="No se pudo convertir ningún documento a PDF. Verifica tu CONVERT_API_SECRET.")
+            
+        if not os.path.exists(salida_final):
+            raise HTTPException(status_code=500, detail="No se pudo crear el archivo PDF consolidado")
 
         # Devolver el archivo directamente
-        return FileResponse(zip_path, media_type='application/zip', filename=zip_filename)
+        return FileResponse(salida_final, media_type='application/pdf', filename=salida_final_name)
 
     except Exception as e:
         import traceback
