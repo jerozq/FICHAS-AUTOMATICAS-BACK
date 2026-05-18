@@ -879,10 +879,18 @@ async def generate_documents(datos: Dict[str, Any]):
         orden = [pdf_excel1, pdf_word, pdf_excel2]
         orden_existentes = [p for p in orden if p and os.path.exists(p)]
         
-        nombre_completo = f"{datos.get('primer_nombre','')} {datos.get('segundo_nombre','')} {datos.get('primer_apellido','')} {datos.get('segundo_apellido','')}".strip().replace(" ", "_").upper()
-        if not nombre_completo: nombre_completo = "SIN_NOMBRE"
-        
-        salida_final_name = f"FICHA_{nombre_completo}.pdf"
+        nombre_completo = " ".join([
+            str(datos.get('primer_nombre', '')).strip(),
+            str(datos.get('segundo_nombre', '')).strip(),
+            str(datos.get('primer_apellido', '')).strip(),
+            str(datos.get('segundo_apellido', '')).strip(),
+        ]).strip()
+        nombre_completo = re.sub(r'\s+', ' ', nombre_completo)
+        nombre_completo = re.sub(r'[<>:"/\\|?*]', '', nombre_completo)
+        if not nombre_completo:
+            nombre_completo = "SIN NOMBRE"
+
+        salida_final_name = f"FICHA {nombre_completo}.pdf"
         salida_final = os.path.join(RUTA_SALIDA, salida_final_name)
         
         if len(orden_existentes) > 0:
