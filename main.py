@@ -3,9 +3,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 except ImportError:
     pass
 import shutil
@@ -37,6 +38,8 @@ except Exception:
 
 import docx
 import re
+import json
+import unicodedata
 
 app = FastAPI(title="Fichas Automáticas API")
 
@@ -49,8 +52,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUTA_FORMATOS = os.path.join(BASE_DIR, "formatos")
+WORKSPACE_ROOT = os.path.dirname(os.path.dirname(BASE_DIR))
 # En Vercel, solo podemos escribir en /tmp
 RUTA_SALIDA = os.path.join(tempfile.gettempdir(), "fichas_salida")
 os.makedirs(RUTA_FORMATOS, exist_ok=True)
@@ -76,6 +79,344 @@ def escribir_celda(ws, celda_ref: str, valor: str):
             return
     celda.value = valor
 
+EXTRACTABLE_FIELDS = {
+    "primer_nombre", "segundo_nombre", "primer_apellido", "segundo_apellido",
+    "tipo_documento", "cedula", "expedida_en", "fecha_expedicion", "fecha_nacimiento",
+    "nacionalidad", "sexo", "direccion", "barrio", "vereda", "departamento",
+    "municipio", "correo", "celular", "telefono", "nivel_educativo", "estado_civil",
+    "n_hijos", "estrato", "situacion_laboral", "vivienda", "ingreso_mensual", "cargo",
+    "rus", "ruc", "lugar_recepcion", "fecha_recepcion", "conducta_punible", "numero_proceso",
+    "fecha_hora_captura", "fiscal", "juez", "privado_libertad", "centro_reclusion", "resumen_hechos"
+}
+
+DEFAULT_GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-lite-001",
+]
+
+def _strip_markdown_fences(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*", "", cleaned).strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+    return cleaned
+
+def _safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+def _normalize_choice(value: str, mapping: Dict[str, str]) -> str:
+    normalized = _safe_str(value).lower()
+    if not normalized:
+        return ""
+    return mapping.get(normalized, normalized)
+
+def _digits_only(value: str) -> str:
+    return re.sub(r"\D", "", _safe_str(value))
+
+def _normalize_date_for_html(value: str) -> str:
+    raw = _safe_str(value)
+    if not raw:
+        return ""
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return raw
+
+    m = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw)
+    if m:
+        day = int(m.group(1))
+        month = int(m.group(2))
+        year = int(m.group(3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+
+    return ""
+
+def _is_reasonable_text(value: str, max_len: int = 120) -> bool:
+    text = _safe_str(value)
+    if not text:
+        return False
+    if len(text) > max_len:
+        return False
+    return "\n" not in text and "\r" not in text
+
+def _is_valid_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", _safe_str(value)))
+
+def _normalize_text_token(text: str) -> str:
+    plain = unicodedata.normalize("NFD", _safe_str(text))
+    plain = "".join(ch for ch in plain if unicodedata.category(ch) != "Mn")
+    return plain.lower().strip()
+
+def _contains_forbidden_context(value: str) -> bool:
+    txt = _normalize_text_token(value)
+    forbidden = (
+        "delito", "conducta punible", "hechos", "preliminar", "preliminares",
+        "direccion", "celular", "telefono", "correo", "fiscal", "juez",
+        "radicado", "proceso", "captura"
+    )
+    return any(token in txt for token in forbidden)
+
+def _is_valid_person_name(value: str) -> bool:
+    text = _safe_str(value)
+    if not text or len(text) > 35:
+        return False
+    if _contains_forbidden_context(text):
+        return False
+    if re.search(r"\d", text):
+        return False
+
+    words = [w for w in re.split(r"\s+", text) if w]
+    if not (1 <= len(words) <= 3):
+        return False
+
+    for w in words:
+        if not re.fullmatch(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]+", w):
+            return False
+    return True
+
+def _is_valid_short_code(value: str) -> bool:
+    text = _safe_str(value)
+    if not text or len(text) > 25:
+        return False
+    if _contains_forbidden_context(text):
+        return False
+    # RUS/RUC suelen ser códigos cortos; bloquear frases con muchos espacios.
+    if len([w for w in text.split(" ") if w]) > 3:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9\-_/\.]+", text))
+
+def _is_valid_cargo(value: str) -> bool:
+    text = _safe_str(value)
+    if not text or len(text) > 90:
+        return False
+    if _contains_forbidden_context(text):
+        return False
+    if any(sep in text for sep in ("\n", "\r", ".", ";", ":")):
+        return False
+    if len([w for w in text.split(" ") if w]) > 8:
+        return False
+    return True
+
+def _normalize_extracted_data(payload: Dict[str, Any], source: str = "local") -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    is_gemini = source == "gemini"
+    normalized: Dict[str, Any] = {}
+    for key, raw_value in payload.items():
+        if key not in EXTRACTABLE_FIELDS:
+            continue
+
+        if key == "privado_libertad":
+            if isinstance(raw_value, bool):
+                normalized[key] = raw_value
+                continue
+            val = _safe_str(raw_value).lower()
+            normalized[key] = val in ("si", "sí", "true", "1", "x", "yes")
+            continue
+
+        val = _safe_str(raw_value)
+        if not val:
+            continue
+
+        if is_gemini and key in ("primer_nombre", "segundo_nombre", "primer_apellido", "segundo_apellido"):
+            if not _is_valid_person_name(val):
+                continue
+
+        if is_gemini and key in ("rus", "ruc"):
+            if not _is_valid_short_code(val):
+                continue
+
+        if is_gemini and key == "cargo":
+            if not _is_valid_cargo(val):
+                continue
+
+        if key == "correo" and not _is_valid_email(val):
+            continue
+
+        if key in ("celular", "telefono"):
+            digits = _digits_only(val)
+            if not (7 <= len(digits) <= 12):
+                continue
+            normalized[key] = digits
+            continue
+
+        if key == "cedula":
+            digits = _digits_only(val)
+            if not (5 <= len(digits) <= 15):
+                continue
+            normalized[key] = digits
+            continue
+
+        if key == "n_hijos":
+            digits = _digits_only(val)
+            if not digits:
+                continue
+            n_hijos_int = int(digits)
+            if n_hijos_int > 30:
+                continue
+            normalized[key] = str(n_hijos_int)
+            continue
+
+        if key == "estrato":
+            digits = _digits_only(val)
+            if digits not in ("0", "1", "2", "3", "4", "5", "6"):
+                continue
+            normalized[key] = digits
+            continue
+
+        if key == "numero_proceso":
+            proc = re.sub(r"\s+", "", val)
+            if not re.fullmatch(r"\d{11,25}(-\d{1,4})?", proc):
+                continue
+            normalized[key] = proc
+            continue
+
+        if key == "fecha_recepcion":
+            normalized_date = _normalize_date_for_html(val)
+            if not normalized_date:
+                continue
+            normalized[key] = normalized_date
+            continue
+
+        if key in ("primer_nombre", "segundo_nombre", "primer_apellido", "segundo_apellido") and not _is_reasonable_text(val, 40):
+            continue
+
+        if key in ("departamento", "municipio", "expedida_en", "nacionalidad") and not _is_reasonable_text(val, 60):
+            continue
+
+        if is_gemini and key in ("ruc", "rus", "fiscal", "juez", "conducta_punible", "cargo") and not _is_reasonable_text(val, 140):
+            continue
+
+        if key == "tipo_documento":
+            type_doc = _normalize_choice(val, {
+                "c.c": "cc", "cc": "cc", "cedula": "cc", "cédula": "cc",
+                "ti": "ti", "t.i": "ti", "ce": "ce", "c.e": "ce"
+            })
+            if type_doc in ("cc", "ti", "ce"):
+                normalized[key] = type_doc
+        elif key == "sexo":
+            sexo = _normalize_choice(val, {
+                "masculino": "masculino", "m": "masculino",
+                "femenino": "femenino", "f": "femenino",
+                "otro": "otro"
+            })
+            if sexo in ("masculino", "femenino", "otro"):
+                normalized[key] = sexo
+        elif key == "estado_civil":
+            estado = _normalize_choice(val, {
+                "soltero": "soltero",
+                "casado": "casado",
+                "separado": "separado",
+                "viudo": "viudo",
+                "union libre": "union libre",
+                "unión libre": "union libre"
+            })
+            if estado in ("soltero", "casado", "separado", "viudo", "union libre"):
+                normalized[key] = estado
+        elif key == "situacion_laboral":
+            laboral = _normalize_choice(val, {
+                "dependiente": "dependiente",
+                "independiente": "independiente",
+                "desempleado": "desempleado",
+                "estudiante": "estudiante",
+                "otros": "otros",
+                "otro": "otros"
+            })
+            if laboral in ("dependiente", "independiente", "desempleado", "estudiante", "otros"):
+                normalized[key] = laboral
+        elif key == "vivienda":
+            vivienda = _normalize_choice(val, {
+                "propia": "propia",
+                "arrendada": "arrendada",
+                "familiar": "familiar",
+                "otros": "otros",
+                "otro": "otros"
+            })
+            if vivienda in ("propia", "arrendada", "familiar", "otros"):
+                normalized[key] = vivienda
+        else:
+            normalized[key] = val
+
+    return normalized
+
+def extraer_datos_con_gemini(texto_plano: str) -> Dict[str, Any]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return {}
+
+    preferred_model = _safe_str(os.getenv("GEMINI_MODEL"))
+    modelos = [preferred_model] if preferred_model else []
+    modelos.extend(model for model in DEFAULT_GEMINI_MODELS if model not in modelos)
+
+    prompt = f"""
+Extrae del siguiente texto los datos para prellenar un formulario judicial.
+
+Reglas estrictas:
+- Devuelve SOLO un JSON valido (sin markdown).
+- No inventes informacion.
+- Si no estas seguro de un campo, OMITELO.
+- No cruces campos: jamas pongas delito/hechos en nombres o apellidos; ni direccion/celular en rus/ruc; ni resumen_hechos en cargo.
+- Usa EXACTAMENTE estos nombres de campo:
+    primer_nombre, segundo_nombre, primer_apellido, segundo_apellido,
+    tipo_documento, cedula, expedida_en, fecha_expedicion, fecha_nacimiento,
+    nacionalidad, sexo, direccion, barrio, vereda, departamento, municipio,
+    correo, celular, telefono, nivel_educativo, estado_civil, n_hijos, estrato,
+    situacion_laboral, vivienda, ingreso_mensual, cargo, rus, ruc,
+    lugar_recepcion, fecha_recepcion, conducta_punible, numero_proceso,
+    fecha_hora_captura, fiscal, juez, privado_libertad, centro_reclusion, resumen_hechos.
+- tipo_documento: cc, ti o ce.
+- sexo: masculino, femenino u otro.
+- estado_civil: soltero, casado, separado, viudo, union libre.
+- situacion_laboral: dependiente, independiente, desempleado, estudiante u otros.
+- vivienda: propia, arrendada, familiar u otros.
+- privado_libertad: true o false.
+
+Texto a analizar:
+{texto_plano}
+"""
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    last_error = None
+    for modelo in modelos:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}"
+        try:
+            response = requests.post(url, json=payload, timeout=45)
+            response.raise_for_status()
+            data = response.json()
+            text_out = (
+                data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+            )
+            if not text_out:
+                continue
+            parsed = json.loads(_strip_markdown_fences(text_out))
+            return _normalize_extracted_data(parsed, source="gemini")
+        except Exception as exc:
+            last_error = exc
+            print(f"Fallo Gemini con modelo {modelo}: {exc}")
+            continue
+
+    print(f"No se pudo extraer con Gemini: {last_error}")
+    return {}
+
 # === EXTRACTION LOGIC ===
 @app.post("/api/extract")
 async def extract_data_from_docx(file: UploadFile = File(...)):
@@ -86,7 +427,9 @@ async def extract_data_from_docx(file: UploadFile = File(...)):
     with open(temp_file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
-    datos = {}
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY no esta configurada en el backend")
+
     try:
         doc = docx.Document(temp_file_path)
     except Exception as e:
@@ -102,149 +445,23 @@ async def extract_data_from_docx(file: UploadFile = File(...)):
                 text = c.text.strip(' \n\r\t')
                 if text and text not in texto_completo:
                     texto_completo.append(text)
-                    
-    # === LÓGICA DE EXTRACCIÓN MEJORADA ===
-    # 1. Búsqueda exacta en tablas (100% Precisión para Plantilla V2)
-    for t in doc.tables:
-        for r in t.rows:
-            if len(r.cells) >= 2:
-                lbl = r.cells[0].text.strip().upper()
-                val = r.cells[1].text.strip()
-                if val:
-                    if "NOMBRES PROCESADO" in lbl:
-                        partes = val.split()
-                        if len(partes) >= 2:
-                            datos['primer_nombre'] = partes[0]
-                            datos['segundo_nombre'] = " ".join(partes[1:])
-                        elif len(partes) == 1:
-                            datos['primer_nombre'] = partes[0]
-                    elif "APELLIDOS PROCESADO" in lbl:
-                        partes = val.split()
-                        if len(partes) >= 2:
-                            datos['primer_apellido'] = partes[0]
-                            datos['segundo_apellido'] = " ".join(partes[1:])
-                        elif len(partes) == 1:
-                            datos['primer_apellido'] = partes[0]
-                    elif "TIPO DOCUMENTO" in lbl: datos['tipo_documento'] = val.lower()
-                    elif "NUMERO DOCUMENTO" in lbl: datos['cedula'] = val.replace(".", "").replace(",", "")
-                    elif "EXPEDIDA EN" in lbl: datos['expedida_en'] = val
-                    elif "FECHA EXPEDICIÓN" in lbl: datos['fecha_expedicion'] = val
-                    elif "FECHA NACIMIENTO" in lbl: datos['fecha_nacimiento'] = val
-                    elif "NACIONALIDAD" in lbl: datos['nacionalidad'] = val
-                    elif "SEXO" in lbl: datos['sexo'] = val.lower()
-                    
-                    elif "DIRECCIÓN DE RESIDENCIA" in lbl: datos['direccion'] = val
-                    elif "DEPARTAMENTO" in lbl: datos['departamento'] = val
-                    elif "MUNICIPIO" in lbl: datos['municipio'] = val
-                    elif "BARRIO" in lbl: datos['barrio'] = val
-                    elif "VEREDA" in lbl: datos['vereda'] = val
-                    elif "CELULAR" in lbl: datos['celular'] = val
-                    elif "TELÉFONO FIJO" in lbl: datos['telefono'] = val
-                    elif "CORREO ELECTRÓNICO" in lbl: datos['correo'] = val
-                    elif "NIVEL EDUCATIVO" in lbl: datos['nivel_educativo'] = val.lower()
-                    elif "ESTADO CIVIL" in lbl: datos['estado_civil'] = val.lower()
-                    elif "NÚMERO DE HIJOS" in lbl: datos['n_hijos'] = val
-                    elif "ESTRATO" in lbl: datos['estrato'] = val
-                    elif "VIVIENDA" in lbl: datos['vivienda'] = val.lower()
-                    elif "SITUACIÓN LABORAL" in lbl: datos['situacion_laboral'] = val.lower()
-                    elif "CARGO" in lbl: datos['cargo'] = val
-                    elif "INGRESO MENSUAL" in lbl: datos['ingreso_mensual'] = val
-                    
-                    elif "RUS" in lbl: datos['rus'] = val
-                    elif "RUC" in lbl: datos['ruc'] = val
-                    elif "LUGAR DE RECEPCIÓN" in lbl: datos['lugar_recepcion'] = val
-                    elif "FECHA DE RECEPCIÓN" in lbl: datos['fecha_recepcion'] = val
-                    elif "CONDUCTA PUNIBLE" in lbl: datos['conducta_punible'] = val
-                    elif "NÚMERO DE PROCESO" in lbl: datos['numero_proceso'] = val
-                    elif "FECHA Y HORA DE CAPTURA" in lbl: datos['fecha_hora_captura'] = val
-                    elif "FISCAL" in lbl: datos['fiscal'] = val
-                    elif "JUZGADO" in lbl: datos['juez'] = val
-                    elif "PRIVADO DE LA LIBERTAD" in lbl: 
-                        datos['privado_libertad'] = val.upper() in ("SI", "SÍ", "TRUE", "X", "1")
-                    elif "CENTRO DE RECLUSIÓN" in lbl: datos['centro_reclusion'] = val
-
-    # Extraer Hechos (Plantilla V2 Tabla 3)
-    try:
-        if len(doc.tables) >= 4:
-            hechos_val = doc.tables[3].rows[1].cells[0].text.strip()
-            if hechos_val:
-                datos['resumen_hechos'] = hechos_val.replace("PARA EL DIA (No modificar esta línea)", "").strip()
-    except Exception:
-        pass
-
-    # 2. Expresiones Regulares de Respaldo (por si es el formato antiguo de texto plano)
     texto_plano = "\n".join(texto_completo)
-    
-    if 'celular' not in datos:
-        m_cel = re.search(r'CEL(?:U?LAR|\.)?\s*[:\-]?\s*(\d{7,10})', texto_plano, re.IGNORECASE)
-        if m_cel: datos['celular'] = m_cel.group(1)
-            
-    if 'estrato' not in datos:
-        m_estrato = re.search(r'ESTRATO\s*(\d)', texto_plano, re.IGNORECASE)
-        if m_estrato: datos['estrato'] = m_estrato.group(1)
-            
-    if 'cedula' not in datos:
-        m_cc = re.search(r'CC\s*([\d\.\,]+)\s+(?:DE\s+)?([A-Z\s]+)', texto_plano)
-        if m_cc: 
-            datos['cedula'] = m_cc.group(1).replace(".", "").replace(",", "")
-            datos['expedida_en'] = m_cc.group(2).strip()
-            datos['tipo_documento'] = 'cc'
-            
-    if 'fecha_nacimiento' not in datos:
-        m_fn = re.search(r'F\.N\s*(\d{2})\s*[-/]?(\d{2})\s*[-/]?(\d{4})', texto_plano)
-        if m_fn: 
-            datos['fecha_nacimiento'] = f"{m_fn.group(1)}-{m_fn.group(2)}-{m_fn.group(3)}"
-            
-    if 'n_hijos' not in datos:
-        m_hijos = re.search(r'HIJOS\s*[:\-]?\s*(\d+)', texto_plano, re.IGNORECASE)
-        if m_hijos: datos['n_hijos'] = m_hijos.group(1)
-            
-    if 'fiscal' not in datos:
-        m_fiscal = re.search(r'(FISCAL[A-Z\s0-9]+(?:\(GARANTIAS\)|\(CONOCIMIENTO\))?)', texto_plano)
-        if m_fiscal: datos['fiscal'] = m_fiscal.group(1).strip()
-            
-    if 'juez' not in datos:
-        m_juez = re.search(r'(JUZGADO[A-Z\s0-9]+)', texto_plano)
-        if m_juez: datos['juez'] = m_juez.group(1).strip()
-            
-    if 'numero_proceso' not in datos:
-        m_proc = re.search(r'\b(\d{21})\b|\b(\d{21}-\d+)\b', texto_plano)
-        if m_proc: 
-            datos['numero_proceso'] = m_proc.group(1) or m_proc.group(2)
-            
-    if 'primer_nombre' not in datos:
-        m_nombres = re.search(r'(?:NOMBRE PROCESADO\n|CEDULA PROCESADO\n)+([A-Z\s]+)\n', texto_plano)
-        if not m_nombres:
-            m_nombres = re.search(r'\b\d{21}.*?\t([A-Z\s]+)', texto_plano)
-        
-        if m_nombres:
-            partes = m_nombres.group(1).strip().split()
-            if len(partes) >= 4:
-                datos['primer_nombre'] = partes[0]
-                datos['segundo_nombre'] = partes[1]
-                datos['primer_apellido'] = partes[2]
-                datos['segundo_apellido'] = " ".join(partes[3:])
-            elif len(partes) == 3:
-                datos['primer_nombre'] = partes[0]
-                datos['primer_apellido'] = partes[1]
-                datos['segundo_apellido'] = partes[2]
-            elif len(partes) == 2:
-                datos['primer_nombre'] = partes[0]
-                datos['primer_apellido'] = partes[1]
-                
-    if 'resumen_hechos' not in datos:
-        m_hechos = re.search(r'LOS SIGUIENTES HECHOS:\s*(.*?)(?:\nPARA EL DIA|\nLE EXPLIQUE|$)', texto_plano, re.DOTALL | re.IGNORECASE)
-        if m_hechos:
-            hechos_texto = m_hechos.group(1).strip()
-            if hechos_texto: datos['resumen_hechos'] = hechos_texto
-        
+    gemini_data = extraer_datos_con_gemini(texto_plano)
+
     # Clean up temp file
     try:
         shutil.rmtree(temp_dir)
     except Exception:
         pass
-        
-    return {"extracted_data": datos}
+
+    return {
+        "extracted_data": gemini_data,
+        "meta": {
+            "gemini_enabled": True,
+            "gemini_used": len(gemini_data) > 0,
+            "fields_detected": len(gemini_data)
+        }
+    }
 
 # === DOCUMENT GENERATION LOGIC ===
 
@@ -359,7 +576,69 @@ def llenar_word(plantilla, salida, datos):
     }
     doc.render(context)
     doc.save(salida)
-     
+
+def obtener_soffice_path():
+    candidates = [
+        os.path.join(WORKSPACE_ROOT, "LibreOfficePortable", "App", "libreoffice", "program", "soffice.exe"),
+        os.path.join(WORKSPACE_ROOT, "LibreOfficePortable", "App", "libreoffice", "program", "soffice.com"),
+        shutil.which("soffice"),
+        shutil.which("libreoffice"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+def convertir_con_libreoffice(file_path: str):
+    soffice_path = obtener_soffice_path()
+    if not soffice_path:
+        return None
+
+    out_dir = os.path.dirname(os.path.abspath(file_path))
+    pdf_path = os.path.splitext(file_path)[0] + ".pdf"
+    try:
+        subprocess.run(
+            [soffice_path, "--headless", "--convert-to", "pdf", os.path.abspath(file_path), "--outdir", out_dir],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if os.path.exists(pdf_path):
+            return pdf_path
+    except Exception as e:
+        print(f"No se pudo convertir con LibreOffice: {e}")
+    return None
+
+def convertir_docx_a_pdf_windows(docx_path):
+    if not WIN32_AVAILABLE:
+        return None
+    word = None
+    document = None
+    pdf_path = docx_path.replace(".docx", ".pdf")
+    try:
+        word = win32.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        document = word.Documents.Open(os.path.abspath(docx_path), ReadOnly=True)
+        document.ExportAsFixedFormat(os.path.abspath(pdf_path), 17)
+        document.Close(False)
+        word.Quit()
+        if os.path.exists(pdf_path):
+            return pdf_path
+    except Exception as e:
+        print(f"No se pudo convertir DOCX con Word: {e}")
+        try:
+            if document:
+                document.Close(False)
+        except Exception:
+            pass
+        try:
+            if word:
+                word.Quit()
+        except Exception:
+            pass
+    return None
+
 def convertir_docx_a_pdf(docx_path):
     pdf_path = docx_path.replace(".docx", ".pdf")
     try:
@@ -367,20 +646,133 @@ def convertir_docx_a_pdf(docx_path):
             docx2pdf_convert(docx_path)
             if os.path.exists(pdf_path):
                 return pdf_path
-        else:
-            # Fallback para Linux usando LibreOffice
-            out_dir = os.path.dirname(os.path.abspath(docx_path))
-            subprocess.run(
-                ["libreoffice", "--headless", "--convert-to", "pdf", os.path.abspath(docx_path), "--outdir", out_dir],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            if os.path.exists(pdf_path):
-                return pdf_path
     except Exception as e:
         print("No se pudo convertir DOCX a PDF:", e)
+    pdf_local = convertir_docx_a_pdf_windows(docx_path)
+    if pdf_local:
+        return pdf_local
+    return convertir_con_libreoffice(docx_path)
+
+def convertir_documento_local(file_path: str):
+    ext = file_path.split('.')[-1].lower()
+    if ext == 'docx':
+        return convertir_docx_a_pdf(file_path)
+    if ext == 'xlsx':
+        pdf_path = file_path.replace('.xlsx', '.pdf')
+        ok, error = convertir_xlsx_a_pdf_windows(file_path, pdf_path)
+        if ok and os.path.exists(pdf_path):
+            return pdf_path
+        if error:
+            print(error)
+        return convertir_con_libreoffice(file_path)
     return None
+
+def convertir_documento_cloudconvert(file_path: str):
+    api_token = os.getenv("CLOUD_CONVERT_API_SECRET")
+    if not api_token:
+        return None
+
+    ext = file_path.split('.')[-1].lower()
+    if ext not in ['docx', 'xlsx']:
+        return None
+
+    api_base = os.getenv("CLOUD_CONVERT_API_BASE", "https://api.cloudconvert.com/v2")
+    filename = os.path.basename(file_path)
+    output_filename = os.path.splitext(filename)[0] + ".pdf"
+
+    try:
+        with open(file_path, "rb") as f:
+            file_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "tasks": {
+                "import-my-file": {
+                    "operation": "import/base64",
+                    "file": file_b64,
+                    "filename": filename,
+                },
+                "convert-my-file": {
+                    "operation": "convert",
+                    "input": "import-my-file",
+                    "input_format": ext,
+                    "output_format": "pdf",
+                    "filename": output_filename,
+                },
+                "export-my-file": {
+                    "operation": "export/url",
+                    "input": "convert-my-file",
+                    "inline": False,
+                    "archive_multiple_files": False,
+                },
+            }
+        }
+
+        create_response = requests.post(f"{api_base}/jobs", headers=headers, json=payload, timeout=60)
+        create_response.raise_for_status()
+        job_data = create_response.json().get("data", {})
+        job_id = job_data.get("id")
+        if not job_id:
+            print(f"Error de CloudConvert: respuesta sin job id: {create_response.text}")
+            return None
+
+        last_job_data = job_data
+        for _ in range(60):
+            job_response = requests.get(f"{api_base}/jobs/{job_id}", headers=headers, timeout=30)
+            job_response.raise_for_status()
+            last_job_data = job_response.json().get("data", {})
+            status = last_job_data.get("status")
+            if status == "finished":
+                break
+            if status == "error":
+                break
+            time.sleep(2)
+
+        if last_job_data.get("status") != "finished":
+            print(f"Error de CloudConvert: job no finalizado correctamente: {last_job_data}")
+            return None
+
+        export_task = None
+        for task in last_job_data.get("tasks", []):
+            if task.get("name") == "export-my-file" or task.get("operation") == "export/url":
+                export_task = task
+                break
+
+        if not export_task:
+            print(f"Error de CloudConvert: no se encontro task export/url: {last_job_data}")
+            return None
+
+        files = export_task.get("result", {}).get("files", [])
+        if not files:
+            print(f"Error de CloudConvert: export/url sin archivos: {export_task}")
+            return None
+
+        download_url = files[0].get("url")
+        if not download_url:
+            print(f"Error de CloudConvert: archivo exportado sin URL: {files[0]}")
+            return None
+
+        download_response = requests.get(download_url, timeout=120)
+        download_response.raise_for_status()
+        out_path = file_path.replace(f".{ext}", ".pdf")
+        with open(out_path, "wb") as out:
+            out.write(download_response.content)
+        return out_path if os.path.exists(out_path) else None
+    except Exception as e:
+        print(f"Error llamando a CloudConvert: {e}")
+        return None
+
+def convertir_documento_a_pdf(file_path: str):
+    pdf_path = convertir_documento_cloudconvert(file_path)
+    if pdf_path and os.path.exists(pdf_path):
+        return pdf_path
+    pdf_path = convertir_documento_api(file_path)
+    if pdf_path and os.path.exists(pdf_path):
+        return pdf_path
+    return convertir_documento_local(file_path)
 
 def convertir_xlsx_a_pdf_windows(xlsx_path, output_pdf_path):
     if not WIN32_AVAILABLE:
@@ -388,7 +780,7 @@ def convertir_xlsx_a_pdf_windows(xlsx_path, output_pdf_path):
     excel = None
     try:
         excel = win32.DispatchEx("Excel.Application")
-        excel.Visible = True
+        excel.Visible = False
         excel.DisplayAlerts = False
         wb = excel.Workbooks.Open(os.path.abspath(xlsx_path), UpdateLinks=False, ReadOnly=True)
         for sheet in wb.Worksheets:
@@ -478,11 +870,10 @@ async def generate_documents(datos: Dict[str, Any]):
         llenar_excel2(formato2_in, excel2_out, datos)
         llenar_word(formato3_in, word_out, datos)
 
-        # Archivos generados correctamente (en /tmp)
-        # Convertirlos a PDF vía ConvertAPI
-        pdf_excel1 = convertir_documento_api(excel1_out)
-        pdf_word = convertir_documento_api(word_out)
-        pdf_excel2 = convertir_documento_api(excel2_out)
+        # Intentar ConvertAPI y, si falla, convertir localmente.
+        pdf_excel1 = convertir_documento_a_pdf(excel1_out)
+        pdf_word = convertir_documento_a_pdf(word_out)
+        pdf_excel2 = convertir_documento_a_pdf(excel2_out)
         
         # Unir PDFs en el orden solicitado: Formato 1, Formato 3, Formato 2
         orden = [pdf_excel1, pdf_word, pdf_excel2]
@@ -497,7 +888,7 @@ async def generate_documents(datos: Dict[str, Any]):
         if len(orden_existentes) > 0:
             unir_pdfs(orden_existentes, salida_final)
         else:
-            raise HTTPException(status_code=500, detail="No se pudo convertir ningún documento a PDF. Verifica tu CONVERT_API_SECRET.")
+            raise HTTPException(status_code=500, detail="No se pudo convertir ningún documento a PDF. ConvertAPI esta agotada y el fallback local tambien fallo.")
             
         if not os.path.exists(salida_final):
             raise HTTPException(status_code=500, detail="No se pudo crear el archivo PDF consolidado")
