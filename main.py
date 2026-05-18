@@ -11,7 +11,7 @@ except ImportError:
     pass
 import shutil
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import tempfile
 import zipfile
 import requests
@@ -91,10 +91,7 @@ EXTRACTABLE_FIELDS = {
 
 DEFAULT_GEMINI_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-lite-001",
+    "gemini-2.5-pro",
 ]
 
 def _strip_markdown_fences(text: str) -> str:
@@ -348,10 +345,10 @@ def _normalize_extracted_data(payload: Dict[str, Any], source: str = "local") ->
 
     return normalized
 
-def extraer_datos_con_gemini(texto_plano: str) -> Dict[str, Any]:
+def extraer_datos_con_gemini(texto_plano: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return {}
+        return {}, {"error": "GEMINI_API_KEY no configurada", "used": False}
 
     preferred_model = _safe_str(os.getenv("GEMINI_MODEL"))
     modelos = [preferred_model] if preferred_model else []
@@ -395,27 +392,52 @@ Texto a analizar:
     last_error = None
     for modelo in modelos:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}"
-        try:
-            response = requests.post(url, json=payload, timeout=45)
-            response.raise_for_status()
-            data = response.json()
-            text_out = (
-                data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-            )
-            if not text_out:
-                continue
-            parsed = json.loads(_strip_markdown_fences(text_out))
-            return _normalize_extracted_data(parsed, source="gemini")
-        except Exception as exc:
-            last_error = exc
-            print(f"Fallo Gemini con modelo {modelo}: {exc}")
-            continue
+        for attempt in range(3):
+            try:
+                response = requests.post(url, json=payload, timeout=45)
+                if response.status_code in (429, 500, 503):
+                    last_error = f"{modelo} temporalmente no disponible (HTTP {response.status_code})"
+                    print(f"Fallo Gemini con modelo {modelo}: {last_error}")
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    break
+
+                response.raise_for_status()
+                data = response.json()
+                text_out = (
+                    data.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                )
+                if not text_out:
+                    last_error = f"{modelo} no devolvio contenido"
+                    break
+
+                parsed = json.loads(_strip_markdown_fences(text_out))
+                normalized = _normalize_extracted_data(parsed, source="gemini")
+                return normalized, {
+                    "used": len(normalized) > 0,
+                    "model": modelo,
+                    "error": None,
+                }
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else "sin_status"
+                body = exc.response.text[:300] if exc.response is not None else str(exc)
+                last_error = f"{modelo} fallo con HTTP {status_code}: {body}"
+                print(f"Fallo Gemini con modelo {modelo}: {last_error}")
+                if status_code in (429, 500, 503) and attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                break
+            except Exception as exc:
+                last_error = f"{modelo} fallo: {exc}"
+                print(f"Fallo Gemini con modelo {modelo}: {last_error}")
+                break
 
     print(f"No se pudo extraer con Gemini: {last_error}")
-    return {}
+    return {}, {"error": str(last_error), "used": False, "model": None}
 
 # === EXTRACTION LOGIC ===
 @app.post("/api/extract")
@@ -446,7 +468,7 @@ async def extract_data_from_docx(file: UploadFile = File(...)):
                 if text and text not in texto_completo:
                     texto_completo.append(text)
     texto_plano = "\n".join(texto_completo)
-    gemini_data = extraer_datos_con_gemini(texto_plano)
+    gemini_data, gemini_meta = extraer_datos_con_gemini(texto_plano)
 
     # Clean up temp file
     try:
@@ -459,7 +481,9 @@ async def extract_data_from_docx(file: UploadFile = File(...)):
         "meta": {
             "gemini_enabled": True,
             "gemini_used": len(gemini_data) > 0,
-            "fields_detected": len(gemini_data)
+            "fields_detected": len(gemini_data),
+            "gemini_model": gemini_meta.get("model"),
+            "gemini_error": gemini_meta.get("error"),
         }
     }
 
