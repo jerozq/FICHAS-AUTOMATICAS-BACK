@@ -1,8 +1,10 @@
 # backend/main.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+import hmac
 import os
+import pathlib
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
     from dotenv import load_dotenv
@@ -43,13 +45,35 @@ import unicodedata
 
 app = FastAPI(title="Fichas Automáticas API")
 
-# Setup CORS to allow the React frontend to communicate with this API
+# Optional shared password. If APP_ACCESS_KEY is unset (local dev) the API stays open.
+APP_ACCESS_KEY = os.getenv("APP_ACCESS_KEY", "").strip()
+PUBLIC_PATHS = {"/api/health", "/api/template"}
+
+
+@app.middleware("http")
+async def require_access_key(request: Request, call_next):
+    if (
+        APP_ACCESS_KEY
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/api/")
+        and request.url.path not in PUBLIC_PATHS
+    ):
+        provided = request.headers.get("x-access-key", "")
+        if not hmac.compare_digest(provided.encode(), APP_ACCESS_KEY.encode()):
+            return JSONResponse(status_code=401, content={"detail": "Contraseña de acceso inválida"})
+    return await call_next(request)
+
+
+# CORS is added after the auth middleware so it wraps 401 responses too.
+# ALLOWED_ORIGINS: comma-separated list, e.g. "https://fichas-web.onrender.com". Defaults to "*".
+_allowed_origins = [o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For local development
-    allow_credentials=True,
+    allow_origins=_allowed_origins or ["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 RUTA_FORMATOS = os.path.join(BASE_DIR, "formatos")
@@ -751,7 +775,7 @@ def convertir_con_libreoffice(file_path: str):
     out_dir = os.path.dirname(os.path.abspath(file_path))
     pdf_path = os.path.splitext(file_path)[0] + ".pdf"
     profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
-    profile_uri = "file:///" + profile_dir.replace("\\", "/").replace(" ", "%20")
+    profile_uri = pathlib.Path(profile_dir).resolve().as_uri()
     try:
         subprocess.run(
             [
@@ -1072,13 +1096,16 @@ async def generate_documents(datos: Dict[str, Any]):
         # Devolver el archivo directamente
         return FileResponse(salida_final, media_type='application/pdf', filename=salida_final_name)
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
-        raise HTTPException(status_code=500, detail=f"Error durante la generación: {str(e)}\n{traceback.format_exc()}")
+        traceback.print_exc()  # full detail stays in server logs only
+        raise HTTPException(status_code=500, detail=f"Error durante la generación: {str(e)}")
 
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
-    file_path = os.path.join(RUTA_SALIDA, filename)
+    file_path = os.path.join(RUTA_SALIDA, os.path.basename(filename))
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
     return FileResponse(file_path, media_type='application/pdf', filename=filename)
@@ -1094,6 +1121,17 @@ async def download_template():
         filename="Plantilla_Defensoria.docx"
     )
 
+@app.get("/api/health")
+async def health():
+    return {"ok": True, "auth_required": bool(APP_ACCESS_KEY), "libreoffice": bool(obtener_soffice_path())}
+
+
+@app.get("/api/auth-check")
+async def auth_check():
+    # Reaching this handler means the access-key middleware accepted the request.
+    return {"ok": True}
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")))

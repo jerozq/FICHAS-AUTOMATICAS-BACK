@@ -1,0 +1,20 @@
+# Render Blueprint for the API (https://render.com/docs/blueprint-spec)
+services:
+  - type: web
+    name: fichas-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CLOUD_CONVERT_API_SECRET
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: APP_ACCESS_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
