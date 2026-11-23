@@ -58,6 +58,7 @@ WORKSPACE_ROOT = os.path.dirname(os.path.dirname(BASE_DIR))
 RUTA_SALIDA = os.path.join(tempfile.gettempdir(), "fichas_salida")
 os.makedirs(RUTA_FORMATOS, exist_ok=True)
 os.makedirs(RUTA_SALIDA, exist_ok=True)
+MAX_BATCH_FILES = 20
 
 # === AUXILIARY FUNCTIONS ===
 def calcular_edad(fecha_nacimiento_str: str) -> str:
@@ -108,6 +109,113 @@ def _safe_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+def _sanitize_filename_component(value: str) -> str:
+    text = _safe_str(value)
+    if not text:
+        return "SIN NOMBRE"
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r'[<>:"/\\|?*]', '', text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "SIN NOMBRE"
+
+def _build_pdf_display_name(datos: Dict[str, Any]) -> str:
+    primer_nombre = _sanitize_filename_component(datos.get("primer_nombre", ""))
+    primer_apellido = _sanitize_filename_component(datos.get("primer_apellido", ""))
+    if primer_nombre == "SIN NOMBRE" and primer_apellido == "SIN NOMBRE":
+        return "Ficha de SIN NOMBRE.pdf"
+    if primer_apellido == "SIN NOMBRE":
+        return f"Ficha de {primer_nombre}.pdf"
+    if primer_nombre == "SIN NOMBRE":
+        return f"Ficha de {primer_apellido}.pdf"
+    return f"Ficha de {primer_nombre} {primer_apellido}.pdf"
+
+def _extract_word_document(temp_file_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    try:
+        doc = docx.Document(temp_file_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo leer el archivo Word: {str(e)}")
+
+    texto_completo = []
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if t:
+            texto_completo.append(t)
+    for t in doc.tables:
+        for r in t.rows:
+            for c in r.cells:
+                text = c.text.strip(' \n\r\t')
+                if text and text not in texto_completo:
+                    texto_completo.append(text)
+
+    texto_plano = "\n".join(texto_completo)
+    gemini_data, gemini_meta = extraer_datos_con_gemini(texto_plano)
+    return gemini_data, gemini_meta
+
+def _procesar_word_subido(file: UploadFile) -> Dict[str, Any]:
+    temp_dir = tempfile.mkdtemp()
+    safe_filename = os.path.basename(_safe_str(file.filename) or f"{uuid.uuid4().hex}.docx")
+    temp_file_path = os.path.join(temp_dir, safe_filename)
+
+    try:
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        if not os.getenv("GEMINI_API_KEY"):
+            raise HTTPException(status_code=503, detail="GEMINI_API_KEY no esta configurada en el backend")
+
+        gemini_data, gemini_meta = _extract_word_document(temp_file_path)
+        return {
+            "ok": True,
+            "filename": file.filename,
+            "extracted_data": gemini_data,
+            "meta": {
+                "gemini_enabled": True,
+                "gemini_used": len(gemini_data) > 0,
+                "fields_detected": len(gemini_data),
+                "gemini_model": gemini_meta.get("model"),
+                "gemini_error": gemini_meta.get("error"),
+            }
+        }
+    except HTTPException as exc:
+        return {
+            "ok": False,
+            "filename": file.filename,
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "extracted_data": {},
+            "meta": {
+                "gemini_enabled": bool(os.getenv("GEMINI_API_KEY")),
+                "gemini_used": False,
+                "fields_detected": 0,
+                "gemini_model": None,
+                "gemini_error": exc.detail,
+            }
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "filename": file.filename,
+            "error": str(exc),
+            "status_code": 500,
+            "extracted_data": {},
+            "meta": {
+                "gemini_enabled": bool(os.getenv("GEMINI_API_KEY")),
+                "gemini_used": False,
+                "fields_detected": 0,
+                "gemini_model": None,
+                "gemini_error": str(exc),
+            }
+        }
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
 
 def _normalize_choice(value: str, mapping: Dict[str, str]) -> str:
     normalized = _safe_str(value).lower()
@@ -178,6 +286,22 @@ def _is_valid_person_name(value: str) -> bool:
         if not re.fullmatch(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]+", w):
             return False
     return True
+
+def _is_gemini_api_key_error(status_code: Any, response_body: str) -> bool:
+    body_lower = _safe_str(response_body).lower()
+    if status_code not in (400, 401, 403):
+        return False
+
+    key_markers = [
+        "api_key_invalid",
+        "api key expired",
+        "api key invalid",
+        "invalid api key",
+        "api_key_expired",
+        "reason\": \"api_key_invalid",
+        "reason\":\"api_key_invalid",
+    ]
+    return any(marker in body_lower for marker in key_markers)
 
 def _is_valid_short_code(value: str) -> bool:
     text = _safe_str(value)
@@ -425,6 +549,15 @@ Texto a analizar:
             except requests.HTTPError as exc:
                 status_code = exc.response.status_code if exc.response is not None else "sin_status"
                 body = exc.response.text[:300] if exc.response is not None else str(exc)
+                body_lower = body.lower()
+                if _is_gemini_api_key_error(status_code, body):
+                    last_error = "La GEMINI_API_KEY expiro o no es valida. Renueva la clave en Google AI Studio, actualiza backend/.env y reinicia el backend."
+                    print(f"Fallo Gemini con modelo {modelo}: {last_error}")
+                    return {}, {"error": last_error, "used": False, "model": modelo}
+                if status_code == 403 and ("reported as leaked" in body_lower or "permission_denied" in body_lower or "api key" in body_lower):
+                    last_error = "La GEMINI_API_KEY fue revocada o marcada como filtrada. Genera una nueva clave en Google AI Studio y reinicia el backend."
+                    print(f"Fallo Gemini con modelo {modelo}: {last_error}")
+                    return {}, {"error": last_error, "used": False, "model": modelo}
                 last_error = f"{modelo} fallo con HTTP {status_code}: {body}"
                 print(f"Fallo Gemini con modelo {modelo}: {last_error}")
                 if status_code in (429, 500, 503) and attempt < 2:
@@ -442,50 +575,47 @@ Texto a analizar:
 # === EXTRACTION LOGIC ===
 @app.post("/api/extract")
 async def extract_data_from_docx(file: UploadFile = File(...)):
-    # Create a temporary file to save the uploaded word document
-    temp_dir = tempfile.mkdtemp()
-    temp_file_path = os.path.join(temp_dir, file.filename)
-    
-    with open(temp_file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY no esta configurada en el backend")
-
-    try:
-        doc = docx.Document(temp_file_path)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"No se pudo leer el archivo Word: {str(e)}")
-        
-    texto_completo = []
-    for p in doc.paragraphs:
-        t = p.text.strip()
-        if t: texto_completo.append(t)
-    for t in doc.tables:
-        for r in t.rows:
-            for c in r.cells:
-                text = c.text.strip(' \n\r\t')
-                if text and text not in texto_completo:
-                    texto_completo.append(text)
-    texto_plano = "\n".join(texto_completo)
-    gemini_data, gemini_meta = extraer_datos_con_gemini(texto_plano)
-
-    # Clean up temp file
-    try:
-        shutil.rmtree(temp_dir)
-    except Exception:
-        pass
-
+    result = _procesar_word_subido(file)
+    if not result.get("ok"):
+        raise HTTPException(status_code=result.get("status_code", 500), detail=result.get("error", "Error al procesar el archivo"))
     return {
-        "extracted_data": gemini_data,
-        "meta": {
-            "gemini_enabled": True,
-            "gemini_used": len(gemini_data) > 0,
-            "fields_detected": len(gemini_data),
-            "gemini_model": gemini_meta.get("model"),
-            "gemini_error": gemini_meta.get("error"),
-        }
+        "extracted_data": result.get("extracted_data", {}),
+        "meta": result.get("meta", {}),
     }
+
+@app.post("/api/extract-batch")
+async def extract_data_from_docx_batch(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Debes subir al menos un archivo Word")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(status_code=400, detail=f"Solo se permiten hasta {MAX_BATCH_FILES} archivos por lote")
+
+    results = []
+    for idx, file in enumerate(files):
+        if not file.filename.lower().endswith(".docx"):
+            results.append({
+                "file_id": str(uuid.uuid4())[:8],
+                "filename": file.filename,
+                "ok": False,
+                "error": "Formato no valido. Solo se aceptan archivos .docx",
+                "status_code": 400,
+                "extracted_data": {},
+                "meta": {
+                    "gemini_enabled": bool(os.getenv("GEMINI_API_KEY")),
+                    "gemini_used": False,
+                    "fields_detected": 0,
+                    "gemini_model": None,
+                    "gemini_error": "Formato no valido. Solo se aceptan archivos .docx",
+                }
+            })
+            continue
+
+        result = _procesar_word_subido(file)
+        result["file_id"] = str(uuid.uuid4())[:8]
+        result["index"] = idx
+        results.append(result)
+
+    return {"results": results}
 
 # === DOCUMENT GENERATION LOGIC ===
 
@@ -620,9 +750,23 @@ def convertir_con_libreoffice(file_path: str):
 
     out_dir = os.path.dirname(os.path.abspath(file_path))
     pdf_path = os.path.splitext(file_path)[0] + ".pdf"
+    profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
+    profile_uri = "file:///" + profile_dir.replace("\\", "/").replace(" ", "%20")
     try:
         subprocess.run(
-            [soffice_path, "--headless", "--convert-to", "pdf", os.path.abspath(file_path), "--outdir", out_dir],
+            [
+                soffice_path,
+                "--headless",
+                "--nologo",
+                "--nofirststartwizard",
+                "--norestore",
+                f"-env:UserInstallation={profile_uri}",
+                "--convert-to",
+                "pdf",
+                os.path.abspath(file_path),
+                "--outdir",
+                out_dir,
+            ],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -631,6 +775,11 @@ def convertir_con_libreoffice(file_path: str):
             return pdf_path
     except Exception as e:
         print(f"No se pudo convertir con LibreOffice: {e}")
+    finally:
+        try:
+            shutil.rmtree(profile_dir)
+        except Exception:
+            pass
     return None
 
 def convertir_docx_a_pdf_windows(docx_path):
@@ -790,6 +939,12 @@ def convertir_documento_cloudconvert(file_path: str):
         return None
 
 def convertir_documento_a_pdf(file_path: str):
+    ext = file_path.split('.')[-1].lower()
+    if ext in ['docx', 'xlsx']:
+        pdf_path = convertir_documento_local(file_path)
+        if pdf_path and os.path.exists(pdf_path):
+            return pdf_path
+
     pdf_path = convertir_documento_cloudconvert(file_path)
     if pdf_path and os.path.exists(pdf_path):
         return pdf_path
@@ -875,7 +1030,7 @@ def convertir_documento_api(file_path: str):
 @app.post("/api/generate")
 async def generate_documents(datos: Dict[str, Any]):
     uid = str(uuid.uuid4())[:8]
-    nombre_base = f"{datos.get('primer_nombre','sin_nombre')}_{datos.get('cedula','')}_{uid}".replace(" ", "_")
+    nombre_base = f"{_sanitize_filename_component(datos.get('primer_nombre', 'sin_nombre'))}_{_sanitize_filename_component(datos.get('cedula', ''))}_{uid}".replace(" ", "_")
     
     excel1_out = os.path.join(RUTA_SALIDA, f"formato1_{nombre_base}.xlsx")
     excel2_out = os.path.join(RUTA_SALIDA, f"formato2_{nombre_base}.xlsx")
@@ -903,19 +1058,8 @@ async def generate_documents(datos: Dict[str, Any]):
         orden = [pdf_excel1, pdf_word, pdf_excel2]
         orden_existentes = [p for p in orden if p and os.path.exists(p)]
         
-        nombre_completo = " ".join([
-            str(datos.get('primer_nombre', '')).strip(),
-            str(datos.get('segundo_nombre', '')).strip(),
-            str(datos.get('primer_apellido', '')).strip(),
-            str(datos.get('segundo_apellido', '')).strip(),
-        ]).strip()
-        nombre_completo = re.sub(r'\s+', ' ', nombre_completo)
-        nombre_completo = re.sub(r'[<>:"/\\|?*]', '', nombre_completo)
-        if not nombre_completo:
-            nombre_completo = "SIN NOMBRE"
-
-        salida_final_name = f"FICHA {nombre_completo}.pdf"
-        salida_final = os.path.join(RUTA_SALIDA, salida_final_name)
+        salida_final_name = _build_pdf_display_name(datos)
+        salida_final = os.path.join(RUTA_SALIDA, f"{uid}_{salida_final_name}")
         
         if len(orden_existentes) > 0:
             unir_pdfs(orden_existentes, salida_final)
